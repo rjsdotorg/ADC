@@ -3,7 +3,7 @@ test/
 .pio/
 .vscode/
 include/lib/
-
+*npy
 
 # Prerequisites
 *.d

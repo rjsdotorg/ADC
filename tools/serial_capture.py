@@ -26,9 +26,6 @@ import serial
 
 
 CH_BLOCK_BYTES = 512                        # per-channel block size in firmware
-BLOCK_BYTES    = 2 * CH_BLOCK_BYTES         # interleaved A0/A1 payload bytes per transfer block
-READ_CHUNK     = 8 * BLOCK_BYTES            # larger host read to reduce Python/USB overhead
-SAMPLES_BLOCK  = BLOCK_BYTES // 2           # uint16 words per interleaved block
 PREAMBLE_LINES = 2                          # "Streaming…" + "Press 'q'…"
 
 
@@ -39,9 +36,11 @@ def flush_preamble(ser: "serial.Serial") -> None:
         print("[preamble]", line.decode(errors="replace").rstrip())
 
 
-def capture(port: str, max_samples: "int | None", out_path: "str | None") -> tuple[np.ndarray, np.ndarray]:
-    chunks_a0: list[np.ndarray] = []
-    chunks_a1: list[np.ndarray] = []
+def capture(port: str, n_chan: int, max_samples: "int | None", out_path: "str | None") -> list[np.ndarray]:
+    block_bytes = n_chan * CH_BLOCK_BYTES
+    read_chunk = 8 * block_bytes
+
+    channel_chunks: list[list[np.ndarray]] = [[] for _ in range(n_chan)]
     total_per_channel = 0
 
     with serial.Serial(port, baudrate=115200, timeout=10.0) as ser:
@@ -80,7 +79,7 @@ def capture(port: str, max_samples: "int | None", out_path: "str | None") -> tup
 
         try:
             while True:
-                raw = ser.read(READ_CHUNK)
+                raw = ser.read(read_chunk)
                 if len(raw) == 0:
                     timeout_count += 1
                     if timeout_count >= 3:
@@ -93,15 +92,15 @@ def capture(port: str, max_samples: "int | None", out_path: "str | None") -> tup
                 partial.extend(raw)
 
                 # Extract complete blocks from partial buffer.
-                while len(partial) >= BLOCK_BYTES:
-                    block = np.frombuffer(bytes(partial[:BLOCK_BYTES]), dtype=np.uint16)
-                    chunks_a0.append(block[0::2])
-                    chunks_a1.append(block[1::2])
-                    total_per_channel += len(block) // 2
-                    del partial[:BLOCK_BYTES]
+                while len(partial) >= block_bytes:
+                    block = np.frombuffer(bytes(partial[:block_bytes]), dtype=np.uint16)
+                    for ch_idx in range(n_chan):
+                        channel_chunks[ch_idx].append(block[ch_idx::n_chan])
+                    total_per_channel += len(block) // n_chan
+                    del partial[:block_bytes]
 
                     # Progress tick every 256 blocks.
-                    if (len(chunks_a0) % 128) == 0:
+                    if (len(channel_chunks[0]) % 128) == 0:
                         print(f"  {total_per_channel:,} samples/channel collected …", end="\r", flush=True)
 
                     if max_samples and total_per_channel >= max_samples:
@@ -133,25 +132,24 @@ def capture(port: str, max_samples: "int | None", out_path: "str | None") -> tup
                     break
                 print("[teensy]", line.decode(errors="replace").rstrip())
 
-    if not chunks_a0:
+    if not channel_chunks[0]:
         print("No data received.")
-        return np.empty(0, dtype=np.uint16), np.empty(0, dtype=np.uint16)
+        return [np.empty(0, dtype=np.uint16) for _ in range(n_chan)]
 
-    samples_a0 = np.concatenate(chunks_a0)
-    samples_a1 = np.concatenate(chunks_a1)
+    channel_samples = [np.concatenate(ch_chunks) for ch_chunks in channel_chunks]
 
-    print(f"Captured {len(samples_a0):,} samples/channel  "
-          f"({(len(samples_a0) + len(samples_a1)) * 2 / 1024:.1f} kB total)")
-    print(f"  A0: min={samples_a0.min()}  max={samples_a0.max()}  "
-          f"mean={samples_a0.mean():.1f}  std={samples_a0.std():.1f}")
-    print(f"  A1: min={samples_a1.min()}  max={samples_a1.max()}  "
-          f"mean={samples_a1.mean():.1f}  std={samples_a1.std():.1f}")
+    total_samples = sum(len(s) for s in channel_samples)
+    print(f"Captured {len(channel_samples[0]):,} samples/channel  "
+          f"({total_samples * 2 / 1024:.1f} kB total)")
+    for ch_idx, samples in enumerate(channel_samples):
+        print(f"  A{ch_idx}: min={samples.min()}  max={samples.max()}  "
+              f"mean={samples.mean():.1f}  std={samples.std():.1f}")
 
     if out_path:
-        np.save(out_path, np.vstack((samples_a0, samples_a1)))
+        np.save(out_path, np.vstack(channel_samples))
         print(f"Saved -> {out_path}")
 
-    return samples_a0, samples_a1
+    return channel_samples
 
 
 def main() -> None:
@@ -160,28 +158,32 @@ def main() -> None:
                         help="Serial port (default: COM3)")
     parser.add_argument("--max-samples",    type=int,  default=None,
                         metavar="N",        help="Stop after N samples")
+    parser.add_argument("--n-chan",         type=int,  default=2,
+                        metavar="N",        help="Number of interleaved channels in stream (default: 2)")
     parser.add_argument("--out",            type=str,  default=None,
                         metavar="FILE.npy", help="Save array to .npy file")
     args = parser.parse_args()
 
-    samples_a0, samples_a1 = capture(args.port, args.max_samples, args.out)
+    if args.n_chan < 1:
+        raise ValueError("--n-chan must be >= 1")
 
-    if len(samples_a0):
-        print(f"\nA0 shape: {samples_a0.shape}, dtype: {samples_a0.dtype}")
-        print(f"A1 shape: {samples_a1.shape}, dtype: {samples_a1.dtype}")
+    channel_samples = capture(args.port, args.n_chan, args.max_samples, args.out)
 
-        volts_a0 = samples_a0 / 2.0**12 * 3.3
-        volts_a1 = samples_a1 / 2.0**12 * 3.3
+    if len(channel_samples[0]):
+        for ch_idx, samples in enumerate(channel_samples):
+            print(f"A{ch_idx} shape: {samples.shape}, dtype: {samples.dtype}")
+
+        volts = [samples / 2.0**12 * 3.3 for samples in channel_samples]
 
         fig, ax = plt.subplots(figsize=(12, 4))
-        ax.plot(volts_a0, linewidth=0.5, label="A0")
-        ax.plot(volts_a1, linewidth=0.5, label="A1")
+        for ch_idx, ch_volts in enumerate(volts):
+            ax.plot(ch_volts, linewidth=0.5, label=f"A{ch_idx}")
         ax.set_xlabel("Sample index")
         ax.set_ylabel("Voltage (V)")
         ax.set_ylim(0, 3.5)
         ax.grid(True, alpha=0.3)
         ax.legend(loc='upper right')
-        ax.set_title(f"ADC capture  –  {len(samples_a0):,} samples/channel")
+        ax.set_title(f"ADC capture  –  {len(channel_samples[0]):,} samples/channel")
 
         plt.tight_layout()
         plt.show()
