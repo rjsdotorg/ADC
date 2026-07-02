@@ -1,5 +1,8 @@
 include/
 test/
+.pio/
+.vscode/
+include/lib/
 
 
 # Prerequisites
