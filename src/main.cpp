@@ -478,7 +478,9 @@ void setup() {
     if (N_CHANNELS > 2) {
       Serial.println("N_CHANNELS > 2 uses round-robin scan mode (lower per-channel rate).");
     }
-    waitSerial("Enter to begin streaming");
+    char msg[64];
+    snprintf(msg, sizeof(msg), "Enter to begin streaming %u channels", (unsigned)N_CHANNELS);
+    waitSerial(msg);
   }
 }
 
