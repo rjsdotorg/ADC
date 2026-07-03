@@ -392,15 +392,21 @@ static void runScanMode() {
 
   const uint32_t startUs = micros();
   uint32_t frameCount = 0;
+  bool stopRequested = false;
 
-  while (!overrun) {
+  while (!overrun && !stopRequested) {
     if (WRITE_SERIAL) {
       int ch;
       while ((ch = Serial.read()) >= 0) {
         if (ch == 'q') {
-          goto scan_done;
+          stopRequested = true;
+          break;
         }
       }
+    }
+
+    if (stopRequested) {
+      break;
     }
 
     for (size_t i = 0; i < N_CHANNELS; i++) {
@@ -435,7 +441,6 @@ static void runScanMode() {
     }
   }
 
-scan_done:
   closeLogFile(logEnabled);
   const uint32_t elapsedUs = micros() - startUs;
 
