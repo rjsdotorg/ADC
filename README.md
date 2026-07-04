@@ -28,15 +28,16 @@ The active firmware is in `src/main.cpp`.
 - **Stream format:**
   - DMA mode: interleaved `uint16` samples `[ch0[0], ch1[0], ch0[1], ch1[1], ...]`
   - Scan mode: frame-based samples `[ch0, ch1, ..., chN-1]` repeated
-- **Ring buffers:** one per channel, 200 blocks each (100 KB total)
+- **Ring buffers:** one per DMA channel, 480 blocks each (`245,760` bytes per channel)
 - **Startup behavior:** automatically discards one warmup block to skip ADC transient
 
 The host-side script is `tools/serial_capture.py`.
 
 It:
 
-- waits for the Teensy prompt
+- auto-detects channel count from Teensy prompt text (`... (N channels)`)
 - starts capture
+- synchronizes at the `---BEGIN BINARY---` sentinel before decoding
 - reads the binary stream in large chunks
 - decodes samples into separate channel arrays (with dynamic deinterleaving)
 - prints per-channel capture statistics
@@ -165,26 +166,25 @@ pip install pyserial numpy matplotlib
 # Dual-channel capture (default)
 python tools/serial_capture.py COM3 --max-samples 1000000 --out adc.npy
 
-# Quad-channel capture
-python tools/serial_capture.py COM3 --n-chan 4 --max-samples 500000 --out adc_4ch.npy
+# Live capture only (no output file)
+python tools/serial_capture.py COM3 --max-samples 1000000
 ```
 
 ### Arguments
 
 - `COM3`: serial port
-- `--n-chan N`: number of channels to decode (default: `2`, range: `1`–`14`)
 - `--max-samples N`: stop after `N` samples per channel
 - `--out FILE.npy`: save stacked `(N_channels, samples_per_channel)` array
 
-**Note:** The `--n-chan` argument must match the firmware's `N_CHANNELS` setting for correct deinterleaving.
+**Note:** Channel count is auto-detected from firmware prompt lines that include `N channels`.
 
 ### Execution Flow
 
 The script will:
 
-1. wait for the firmware prompt (e.g., "Enter to begin streaming")
+1. wait for a firmware prompt containing `N channels`
 2. trigger streaming
-3. capture binary data in large chunks
+3. wait for `---BEGIN BINARY---` and then capture binary data in large chunks
 4. stop the firmware with `q` (or `^C` to abort)
 5. print Teensy-side statistics
 6. plot all channels on a single figure with legend
@@ -218,7 +218,7 @@ Observed performance with dual-channel DMA:
 
 - **~1.3 Msps per channel** at dual-ADC `VERY_HIGH_SPEED` settings
 - Dual ISR-driven DMA with ring buffers ensures consistent throughput
-- USB host latency has minimal impact due to 200-block-deep ring buffers
+- USB host latency has reduced impact due to deep per-channel DMA ring buffers
 
 ### Scan Mode (N_CHANNELS > 2)
 
@@ -231,7 +231,7 @@ Per-sample round-robin reading is slower:
 
 - **ADC speed settings:** VERY_HIGH_SPEED vs. HIGH_SPEED vs. MED_SPEED
 - **Host USB throughput:** local Python script is faster than remote desktop
-- **Ring buffer depth:** 200 blocks × 512 bytes per channel provides good margin
+- **Ring buffer depth:** 480 blocks × 512 bytes per DMA channel provides additional host-latency margin
 - **SD logging (if enabled):** writes occur in background; USB streaming is unaffected
 
 ## Troubleshooting
@@ -247,7 +247,7 @@ Per-sample round-robin reading is slower:
 **If values are off:**
 
 - Verify input wiring on the configured analog pins
-- Check the Python decoder matches the firmware's `N_CHANNELS` setting (use `--n-chan` arg)
+- Confirm firmware `N_CHANNELS` matches your intended channel configuration
 - Ensure ADC resolution is set to 12-bit in firmware
 
 ### Overrun or data loss
@@ -267,9 +267,9 @@ Per-sample round-robin reading is slower:
 
 ### Deinterleaving errors (garbled data)
 
-- Ensure `--n-chan` argument matches firmware `N_CHANNELS` setting
-- For DMA mode (N ≤ 2): use `--n-chan 1` or `--n-chan 2`
-- For scan mode (N > 2): use `--n-chan N` with the exact channel count
+- Ensure firmware prompts include channel count text (`... (N channels)`)
+- If auto-detection falls back to default (`2`), reconnect and rerun capture so the script can parse a fresh prompt
+- Confirm `N_CHANNELS` in firmware matches your intended capture mode
 
 ### Serial monitor reconnect/reset issues
 

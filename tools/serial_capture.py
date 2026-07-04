@@ -13,6 +13,10 @@ This script:
 Usage:
         python serial_capture.py [PORT] [--max-samples N] [--out FILE.npy]
 
+    --max-samples N  stops after N samples per channel (not total across all channels)
+
+    Channel count is auto-detected from the firmware prompt.
+
 Requires:  pip install pyserial numpy
 """
 
@@ -27,33 +31,36 @@ import serial
 
 
 CH_BLOCK_BYTES = 512                        # per-channel block size in firmware
-PREAMBLE_LINES = 2                          # "Streaming…" + "Press 'q'…"
+BINARY_SENTINEL = "---BEGIN BINARY---"
+STATS_SENTINEL_BYTES = b"---STATS---"
 
 
 def parse_channels_from_prompt(line: str) -> "int | None":
-    """Extract channel count from firmware prompt (e.g., 'Enter to begin streaming 2 channels')."""
-    match = re.search(r'streaming\s+(\d+)\s+channels', line, re.IGNORECASE)
+    """Extract channel count from firmware prompt lines that mention '<N> channels'."""
+    match = re.search(r'(\d+)\s+channels', line, re.IGNORECASE)
     return int(match.group(1)) if match else None
 
 
-def flush_preamble(ser: "serial.Serial") -> None:
-    """Read and discard the text lines the firmware sends before binary data."""
-    for _ in range(PREAMBLE_LINES):
-        line = ser.readline()
-        print("[preamble]", line.decode(errors="replace").rstrip())
+def scan_to_binary_start(ser: "serial.Serial") -> None:
+    """Read and print text lines until the binary-start sentinel is received."""
+    while True:
+        line = ser.readline().decode(errors="replace").rstrip()
+        if not line:
+            raise RuntimeError("Timed out waiting for ---BEGIN BINARY--- sentinel from firmware")
+        print("[preamble]", line)
+        if line == BINARY_SENTINEL:
+            return
 
 
-def capture(port: str, n_chan: "int | None", max_samples: "int | None", out_path: "str | None") -> list[np.ndarray]:
-    """Capture interleaved stream from Teensy, auto-detecting channel count if n_chan is None."""
-    auto_detected_channels = None
-    n_chan_detected = n_chan
+def capture(port: str, max_samples: "int | None", out_path: "str | None") -> list[np.ndarray]:
+    """Capture interleaved stream from Teensy, auto-detecting channel count from the firmware prompt."""
+    n_chan_detected = None
 
     with serial.Serial(port, baudrate=115200, timeout=10.0) as ser:
         # Disable DTR/RTS to avoid spurious resets.
         ser.dtr = False
         ser.rts = False
 
-        # Drain anything already in the OS buffer.
         ser.reset_input_buffer()
 
         # Wait for the Teensy's "Enter to begin streaming N channels" prompt.
@@ -68,19 +75,13 @@ def capture(port: str, n_chan: "int | None", max_samples: "int | None", out_path
             if "Enter to" in line:
                 detected = parse_channels_from_prompt(line)
                 if detected is not None:
-                    auto_detected_channels = detected
+                    n_chan_detected = detected
+                    print(f"[auto] Detected N_CHANNELS={n_chan_detected} from firmware prompt")
                 break
 
-        # Use auto-detected channels if n_chan was not specified.
         if n_chan_detected is None:
-            if auto_detected_channels is not None:
-                n_chan_detected = auto_detected_channels
-                print(f"[auto] Detected N_CHANNELS={n_chan_detected} from firmware prompt")
-            else:
-                n_chan_detected = 2  # fallback default
-                print(f"[auto] Could not parse channel count; using default {n_chan_detected}")
-        elif auto_detected_channels is not None and auto_detected_channels != n_chan_detected:
-            print(f"[warn] Firmware reports {auto_detected_channels} channels but --n-chan={n_chan_detected}; using {n_chan_detected}")
+            n_chan_detected = 2  # fallback default
+            print(f"[auto] Could not parse channel count; using default {n_chan_detected}")
 
         block_bytes = n_chan_detected * CH_BLOCK_BYTES
         read_chunk = 8 * block_bytes
@@ -95,17 +96,20 @@ def capture(port: str, n_chan: "int | None", max_samples: "int | None", out_path
         ser.flush()
         ser.timeout = 10.0
 
-        flush_preamble(ser)
+        scan_to_binary_start(ser)
 
         print(f"Capturing from {port}  (Ctrl-C to stop) …")
 
         partial = bytearray()  # buffer for partial blocks
         timeout_count = 0
         reached_limit = False
+        firmware_stopped = False
 
         try:
             while True:
-                raw = ser.read(read_chunk)
+                # Read all bytes already in the OS buffer to prevent backpressure.
+                avail = ser.in_waiting
+                raw = ser.read(avail if avail > read_chunk else read_chunk)
                 if len(raw) == 0:
                     timeout_count += 1
                     if timeout_count >= 3:
@@ -116,6 +120,15 @@ def capture(port: str, n_chan: "int | None", max_samples: "int | None", out_path
 
                 timeout_count = 0  # reset on any data
                 partial.extend(raw)
+
+                # Firmware prints text stats when streaming stops (normal stop or overrun).
+                # Stop binary parsing at that boundary to avoid treating ASCII as ADC samples.
+                stats_idx = partial.find(STATS_SENTINEL_BYTES)
+                if stats_idx != -1:
+                    stream_bytes = bytes(partial[:stats_idx])
+                    partial.clear()
+                    partial.extend(stream_bytes)
+                    firmware_stopped = True
 
                 # Extract complete blocks from partial buffer.
                 while len(partial) >= block_bytes:
@@ -134,7 +147,9 @@ def capture(port: str, n_chan: "int | None", max_samples: "int | None", out_path
                         reached_limit = True
                         break
 
-                if reached_limit:
+                if reached_limit or firmware_stopped:
+                    if firmware_stopped:
+                        print("\n[info] Firmware ended stream; stopping binary capture.")
                     break
 
         except KeyboardInterrupt:
@@ -145,18 +160,26 @@ def capture(port: str, n_chan: "int | None", max_samples: "int | None", out_path
             ser.flush()
             # Discard any trailing binary data until the stats sentinel.
             ser.timeout = 2.0
+            saw_stats = False
             while True:
                 line = ser.readline()
                 if not line:
                     break
                 decoded = line.decode(errors="replace").rstrip()
                 if decoded == "---STATS---":
+                    saw_stats = True
                     break  # found sentinel, stats follow
-            while True:
-                line = ser.readline()
-                if not line:
-                    break
-                print("[teensy]", line.decode(errors="replace").rstrip())
+            if saw_stats:
+                # Read only the current stats block. Stop at the next prompt to avoid
+                # hanging when firmware repeats "Enter to stream again" indefinitely.
+                while True:
+                    line = ser.readline()
+                    if not line:
+                        break
+                    decoded = line.decode(errors="replace").rstrip()
+                    if decoded.startswith("Enter to stream again"):
+                        break
+                    print("[teensy]", decoded)
 
     if not channel_chunks[0]:
         print("No data received.")
@@ -183,17 +206,12 @@ def main() -> None:
     parser.add_argument("port",             nargs="?", default="COM3",
                         help="Serial port (default: COM3)")
     parser.add_argument("--max-samples",    type=int,  default=None,
-                        metavar="N",        help="Stop after N samples")
-    parser.add_argument("--n-chan",         type=int,  default=None,
-                        metavar="N",        help="Number of interleaved channels (default: auto-detect from firmware)")
+                        metavar="SAMPLES",  help="Stop after N samples per channel")
     parser.add_argument("--out",            type=str,  default=None,
                         metavar="FILE.npy", help="Save array to .npy file")
     args = parser.parse_args()
 
-    if args.n_chan is not None and args.n_chan < 1:
-        raise ValueError("--n-chan must be >= 1")
-
-    channel_samples = capture(args.port, args.n_chan, args.max_samples, args.out)
+    channel_samples = capture(args.port, args.max_samples, args.out)
 
     if len(channel_samples[0]):
         for ch_idx, samples in enumerate(channel_samples):

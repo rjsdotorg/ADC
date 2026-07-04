@@ -29,9 +29,10 @@
 const bool WRITE_LOG = false;
 const bool WRITE_SERIAL = true;
 const size_t N_CHANNELS = 2;
+const size_t CLOCK_SPEED_MHZ = 600; // up to 916;
 
 const size_t BUF_BLOCK_SIZE = 512; // Must be multiple of 32 for DMA and cache alignment.  Each channel has its own buffer.
-const size_t RING_BUF_SIZE = 200 * BUF_BLOCK_SIZE; // Per-channel ring buffer size.
+const size_t RING_BUF_SIZE = 480 * BUF_BLOCK_SIZE; // Per-channel ring buffer size.  Placed in OCRAM; sized for ~200 ms of USB stall headroom.
 const size_t WARMUP_BLOCKS = 1;                    // Discard startup transient (256 samples/block)
 const size_t MAX_CHANNELS = 14;
 const uint32_t LOG_ONLY_RUN_US = 10U * 1000000U;
@@ -57,8 +58,8 @@ DMAChannel dma0(true);
 DMAChannel dma1(true);
 DMAMEM static uint16_t __attribute__((aligned(32))) dmaBuf0[SAMPLES_PER_CH_BLOCK];
 DMAMEM static uint16_t __attribute__((aligned(32))) dmaBuf1[SAMPLES_PER_CH_BLOCK];
-RingBuf<char, RING_BUF_SIZE> rb0;
-RingBuf<char, RING_BUF_SIZE> rb1;
+DMAMEM static RingBuf<char, RING_BUF_SIZE> rb0; // OCRAM: keeps large buffers out of DTCM
+DMAMEM static RingBuf<char, RING_BUF_SIZE> rb1;
 
 SdFs sd;
 FsFile logFile;
@@ -181,14 +182,19 @@ static void stopDma() {
   }
 }
 
-static void waitSerial(const char* msg) {
+static void waitSerial(const char* msg, bool repeat = false) {
   while (Serial.read() >= 0) {
     delay(1);
   }
   Serial.println(msg);
+  uint32_t lastPrintMs = millis();
   while (!Serial.available()) {
     yield();
     delay(1);
+    if (repeat && (millis() - lastPrintMs) >= 500) {
+      Serial.println(msg);
+      lastPrintMs = millis();
+    }
   }
   while (Serial.read() >= 0) {
     delay(1);
@@ -248,6 +254,10 @@ static void runDmaMode(uint8_t pin0, uint8_t pin1) {
   uint16_t ch1Buf[SAMPLES_PER_CH_BLOCK];
   uint16_t txSamples[2 * SAMPLES_PER_CH_BLOCK];
   uint8_t txBuf[BUF_BLOCK_SIZE];
+
+  if (WRITE_SERIAL) {
+    Serial.println("---BEGIN BINARY---");
+  }
 
   const uint32_t startUs = micros();
   bool stopRequested = false;
@@ -390,6 +400,10 @@ static void runScanMode() {
     }
   }
 
+  if (WRITE_SERIAL) {
+    Serial.println("---BEGIN BINARY---");
+  }
+
   const uint32_t startUs = micros();
   uint32_t frameCount = 0;
   bool stopRequested = false;
@@ -466,6 +480,7 @@ void setup() {
   }
 
   Serial.println("ADC DMA USB Streamer v" VERSION_STRING);
+  Serial.printf("CPU clock: %u MHz\n", (unsigned)CLOCK_SPEED_MHZ);
 
   adc.adc0->setAveraging(0);
   adc.adc0->setResolution(12);
@@ -485,7 +500,7 @@ void setup() {
     }
     char msg[64];
     snprintf(msg, sizeof(msg), "Enter to begin streaming %u channels", (unsigned)N_CHANNELS);
-    waitSerial(msg);
+    waitSerial(msg, /*repeat=*/true);
   }
 }
 
@@ -497,6 +512,8 @@ void loop() {
   }
 
   if (WRITE_SERIAL) {
-    waitSerial("Enter to stream again");
+    char msg[64];
+    snprintf(msg, sizeof(msg), "Enter to stream again (%u channels)", (unsigned)N_CHANNELS);
+    waitSerial(msg, /*repeat=*/true);
   }
 }
